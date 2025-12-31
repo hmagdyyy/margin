@@ -7,9 +7,9 @@ import streamlit as st
 # Streamlit config
 # ==============================
 st.set_page_config(page_title="Interest Expectation Tool", layout="wide")
-st.title("Interest Expectation Tool (Offline)")
+st.title("Interest Expectation Tool")
 
-# (Optional) allow large tables without Styler crash; we avoid Styler anyway.
+# Avoid styler rendering limits by not using .style
 pd.set_option("styler.render.max_elements", 1_000_000)
 
 # ==============================
@@ -21,12 +21,14 @@ if "uploads_by_day" not in st.session_state:
 
 if "processed" not in st.session_state:
     st.session_state["processed"] = False
-if "summary_df" not in st.session_state:
-    st.session_state["summary_df"] = None
+if "summary_base" not in st.session_state:
+    st.session_state["summary_base"] = None
 if "exposure_df" not in st.session_state:
     st.session_state["exposure_df"] = None
 if "edited_df" not in st.session_state:
     st.session_state["edited_df"] = None
+if "num_days_in_period" not in st.session_state:
+    st.session_state["num_days_in_period"] = None
 
 
 # =========================================================
@@ -42,7 +44,6 @@ def read_csv_smart(file_like):
     encodings = ["utf-8-sig", "cp1256", "windows-1256", "latin1"]
     last_error = None
 
-    # file_like is a BytesIO or Streamlit UploadedFile
     for enc in encodings:
         try:
             file_like.seek(0)
@@ -52,9 +53,9 @@ def read_csv_smart(file_like):
             last_error = e
             continue
 
-        # detect delimiter
         lines = [ln for ln in text.splitlines() if ln.strip()]
         first = lines[0] if lines else ""
+
         candidates = [",", ":", ";", "\t"]
         best = ","
         best_cols = 1
@@ -83,6 +84,17 @@ def detect_column(columns, candidates):
     return None
 
 
+def normalize_account(x: str) -> str:
+    """
+    Normalize account strings for exact matching:
+    - strip spaces
+    - keep as string (do NOT cast to int, to preserve leading zeros)
+    """
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
 # =========================================================
 # Lending & commission readers
 # =========================================================
@@ -90,7 +102,7 @@ def read_single_lending_file(file_like, day_raw):
     """
     Read ONE lending file for a specific day.
 
-    Lending columns:
+    Lending columns (Arabic):
       - name:    'اسم العميل' or 'العميل' or 'اسم'
       - account: 'حساب العميل' (preferred) or 'الكود'
       - debt:    'المديونية'
@@ -127,25 +139,29 @@ def read_single_lending_file(file_like, day_raw):
     df = df[["date", "name", "account", "lending"]].copy()
 
     df["name"] = df["name"].astype(str).str.strip()
-    df["account"] = df["account"].astype(str).str.strip()
+    df["account"] = df["account"].apply(normalize_account)
     df["lending"] = pd.to_numeric(df["lending"], errors="coerce").fillna(0.0)
+
+    # Drop empty accounts (can cause bad matching)
+    df = df[df["account"].astype(str).str.strip() != ""].copy()
 
     return df, None
 
 
 def read_commission_file(uploaded_file):
     """
-    Commission columns:
-      - name:  'الاسم' or 'اسم'
-      - comm:  'اجمالي العمولات' or 'إجمالي العمولات'  (spaces tolerated)
-      - acct optional: 'الكود' or 'حساب العميل'
+    Commission file columns (Arabic, spaces tolerated):
+      - account: REQUIRED now (match by account)
+          'الكود' or 'حساب العميل'
+      - commission: REQUIRED
+          'اجمالي العمولات' (or with different hamza/spaces)
+      - name: optional ('الاسم' or 'اسم') - not used for matching
     """
     try:
         df = read_csv_smart(uploaded_file)
     except Exception as e:
         return None, f"Error reading commissions file '{getattr(uploaded_file, 'name', '')}': {e}"
 
-    # normalize to find columns even if extra spaces
     original_cols = [str(c) for c in df.columns]
     stripped_map = {str(c).strip(): c for c in df.columns}
 
@@ -155,21 +171,23 @@ def read_commission_file(uploaded_file):
                 return stripped_map[c]
         return None
 
-    name_col = find_key(["الاسم", "اسم"])
     acct_col = find_key(["الكود", "حساب العميل"])
     comm_col = find_key(["اجمالي العمولات", "إجمالي العمولات", "اجمالي العمولات ", " اجمالي العمولات"])
 
-    if name_col is None or comm_col is None:
+    if acct_col is None or comm_col is None:
         return None, (
             f"Commissions file missing required columns.\n"
-            f"Need: الاسم/اسم and اجمالي العمولات\n"
+            f"Need: الكود/حساب العميل and اجمالي العمولات\n"
             f"Detected columns: {', '.join(original_cols)}"
         )
 
     out = pd.DataFrame()
-    out["name"] = df[name_col].astype(str).str.strip()
-    out["account"] = df[acct_col].astype(str).str.strip() if acct_col is not None else ""
+    out["account"] = df[acct_col].apply(normalize_account)
     out["commission"] = pd.to_numeric(df[comm_col], errors="coerce").fillna(0.0)
+
+    # Drop empty accounts
+    out = out[out["account"].astype(str).str.strip() != ""].copy()
+
     return out, None
 
 
@@ -182,7 +200,7 @@ def build_full_daily_lending(df_lending, start_date, end_date, uploaded_days):
 
     Rule:
     - If a day has an uploaded file:
-        missing client row => lending = 0 that day
+        missing (name, account) row => lending = 0 that day
     - If a day has NO uploaded file:
         forward-fill from most recent previous day
     """
@@ -201,7 +219,9 @@ def build_full_daily_lending(df_lending, start_date, end_date, uploaded_days):
     uploaded_days = sorted({pd.to_datetime(d).normalize() for d in uploaded_days})
     all_dates = pd.date_range(start=start_ts, end=end_ts, freq="D")
 
+    # Universe comes ONLY from uploaded lending files (base truth)
     clients = df[["name", "account"]].drop_duplicates()
+
     idx = pd.MultiIndex.from_product(
         [clients["name"], clients["account"], all_dates],
         names=["name", "account", "date"],
@@ -226,93 +246,95 @@ def build_full_daily_lending(df_lending, start_date, end_date, uploaded_days):
     return df_full
 
 
-def compute_summary(df_daily, df_commissions, default_rate, df_lending_base):
+def compute_summary_by_account(df_daily, df_commissions, default_rate, start_date, end_date):
     """
-    One row per client name.
+    One row per (Account Number) from lending files.
+    Commission matched by account number EXACTLY.
 
-    Total Margin Lending = sum of daily lending (debt) across all days
-    Total Interest       = Total Margin Lending * Rate
-    Total Commission     = sum commissions across ALL accounts (by name)
-    Difference           = max(Total Interest - Total Commission, 0)
-
-    Account Number shown = ONLY from margin files (df_lending_base), never from commissions.
-    If multiple margin accounts exist per name, they are joined.
+    Columns:
+      - Name (from lending)
+      - Account Number (from lending)
+      - Rate
+      - Total Margin Lending (sum of daily debt over period)
+      - Average Margin Lending (Total / number_of_days_in_period)
+      - Total Interest (Total Margin Lending * Rate)
+      - Total Commission (sum commissions for same account)
+      - Difference (max(Total Interest - Total Commission, 0))
     """
-    # total daily margin (sum debt over days)
+    # days in selected period (inclusive)
+    num_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days + 1
+    num_days = max(int(num_days), 1)
+
+    # If a name appears multiple times for same account (rare), take most frequent / last
+    # We'll use the latest name observed in df_daily for that account.
+    name_by_account = (
+        df_daily.sort_values("date")
+        .groupby("account")["name"]
+        .last()
+        .reset_index()
+    )
+
     exposure = (
-        df_daily.groupby("name")["lending"]
+        df_daily.groupby("account")["lending"]
         .sum()
         .reset_index()
-        .rename(columns={"lending": "total_margin_lending"})
+        .rename(columns={"lending": "Total Margin Lending"})
     )
 
-    # accounts from margin files only
-    def join_accounts(series):
-        uniq = sorted({str(a).strip() for a in series if str(a).strip()})
-        return ", ".join(uniq)
+    summary = exposure.merge(name_by_account, on="account", how="left")
 
-    margin_accounts = (
-        df_lending_base.groupby("name")["account"]
-        .apply(join_accounts)
-        .reset_index()
-        .rename(columns={"account": "Account Number"})
-    )
-
-    exposure = exposure.merge(margin_accounts, on="name", how="left")
-
-    # commission by name across all accounts
-    comm_client = (
-        df_commissions.groupby("name")["commission"]
+    # Commission per account (exact match)
+    comm_acc = (
+        df_commissions.groupby("account")["commission"]
         .sum()
         .reset_index()
         .rename(columns={"commission": "Total Commission"})
     )
 
-    summary = exposure.merge(comm_client, on="name", how="left")
+    summary = summary.merge(comm_acc, on="account", how="left")
     summary["Total Commission"] = summary["Total Commission"].fillna(0.0)
 
+    summary = summary.rename(columns={"name": "Name", "account": "Account Number"})
+
     summary["Rate"] = float(default_rate)
-    summary["Total Margin Lending"] = summary["total_margin_lending"]
+    summary["Average Margin Lending"] = summary["Total Margin Lending"] / num_days
     summary["Total Interest"] = summary["Total Margin Lending"] * summary["Rate"]
     summary["Difference"] = (summary["Total Interest"] - summary["Total Commission"]).clip(lower=0.0)
 
-    summary = summary.rename(columns={"name": "Name"})
-    exposure_df = exposure  # keep total_margin_lending for recalcs
-    return summary, exposure_df
+    # Keep exposure_df for instant recalcs (by Account Number)
+    exposure_df = summary[["Account Number", "Total Margin Lending"]].copy()
+    return summary, exposure_df, num_days
 
 
-def recalc_with_new_rates(edited_df, exposure_df):
+def recalc_with_new_rates(edited_df, exposure_df, num_days):
     """
-    Recalculate Total Interest + Difference after user edits Rate per client.
+    Recalculate Total Interest + Difference after user edits Rate per account.
     """
-    exp = exposure_df.rename(columns={"name": "Name"})
-    merged = edited_df.merge(exp[["Name", "total_margin_lending"]], on="Name", how="left")
+    merged = edited_df.merge(exposure_df, on="Account Number", how="left", suffixes=("", "_base"))
 
-    merged["Total Margin Lending"] = merged["total_margin_lending"]
+    # Ensure Total Margin Lending is the base one
+    merged["Total Margin Lending"] = merged["Total Margin Lending_base"].fillna(0.0)
+    merged = merged.drop(columns=["Total Margin Lending_base"])
+
+    merged["Average Margin Lending"] = merged["Total Margin Lending"] / max(int(num_days), 1)
     merged["Total Interest"] = merged["Total Margin Lending"] * merged["Rate"]
     merged["Difference"] = (merged["Total Interest"] - merged["Total Commission"]).clip(lower=0.0)
 
-    merged = merged.drop(columns=["total_margin_lending"])
     return merged
 
 
 def create_excel_bytes(df_final):
-    """
-    Export required columns.
-    """
-    export = df_final.copy()
-    export = export.rename(columns={"Rate": "Interest Rate"})
-
     cols = [
         "Name",
         "Account Number",
-        "Interest Rate",
+        "Rate",
         "Total Margin Lending",
+        "Average Margin Lending",
         "Total Interest",
         "Total Commission",
         "Difference",
     ]
-    export = export[cols]
+    export = df_final[cols].copy()
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -326,14 +348,12 @@ def create_excel_bytes(df_final):
 # ==============================
 st.markdown(
     """
-**Logic**
-- Upload daily margin lending files per day (grid).
-- If a day has a file uploaded and a client is missing from it → margin for that day = **0**.
-- If a day has no file uploaded → use most recent previous uploaded day (forward-fill).
-- Total Margin Lending = sum of daily debt over period.
-- Total Interest = Total Margin Lending × daily rate (per client).
-- Total Commission = sum of commissions across accounts (by client name).
-- Difference = max(Total Interest − Total Commission, 0).
+**Updated Logic**
+- Commission matching is now **by Account Number** (exact match).
+- Summary is **one row per Account Number** found in the margin files.
+- If a day has a file uploaded and an account is missing → that account’s margin for the day = **0**.
+- If a day has no file uploaded → forward-fill using most recent previous uploaded day.
+- **Average Margin Lending** = Total Margin Lending ÷ number of days in selected period.
 """
 )
 
@@ -383,7 +403,6 @@ if all_dates:
 
     st.markdown("Upload a file in the day cell. ✅ means the file is saved (persisted) even if Streamlit reruns.")
 
-    # Build the grid week by week
     current_date = first_monday
     while current_date <= last_date:
         cols = st.columns(7)
@@ -395,7 +414,6 @@ if all_dates:
                     title = f"{day} {'✅' if saved else ''}"
                     st.markdown(f"**{title}**")
 
-                    # One uploader per day (grid style)
                     f = st.file_uploader(
                         "File",
                         type=["txt", "csv"],
@@ -404,13 +422,12 @@ if all_dates:
                         label_visibility="collapsed",
                     )
 
-                    # Persist the uploaded file into session_state as bytes (CRITICAL for Streamlit Cloud)
+                    # Persist uploaded file to session_state bytes (important for Streamlit Cloud)
                     if f is not None:
                         uploads_by_day[day] = {"name": f.name, "bytes": f.getvalue()}
                         st.session_state["uploads_by_day"] = uploads_by_day
                         st.caption(f"Saved: {f.name}")
 
-                    # Optional remove button
                     if saved:
                         if st.button("Remove", key=f"rm_{day.isoformat()}"):
                             uploads_by_day.pop(day, None)
@@ -440,7 +457,7 @@ if process_btn:
         st.error("Please upload at least one daily lending file.")
         st.stop()
 
-    # Build lending frames from persisted bytes (NOT from current uploader objects)
+    # Build lending frames from persisted bytes
     lending_frames = []
     for day, obj in sorted(uploads_by_day.items(), key=lambda x: x[0]):
         bio = io.BytesIO(obj["bytes"])
@@ -465,19 +482,25 @@ if process_btn:
         st.warning("No lending data found in the selected date range after processing.")
         st.stop()
 
-    summary_df, exposure_df = compute_summary(df_daily, df_comm, default_rate, df_lending)
+    summary_df, exposure_df, num_days = compute_summary_by_account(
+        df_daily=df_daily,
+        df_commissions=df_comm,
+        default_rate=default_rate,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
-    # Store processed outputs
     st.session_state["processed"] = True
-    st.session_state["summary_df"] = summary_df
+    st.session_state["summary_base"] = summary_df
     st.session_state["exposure_df"] = exposure_df
+    st.session_state["num_days_in_period"] = num_days
 
-    # Initialize editor df
     editable_cols = [
         "Name",
         "Account Number",
         "Rate",
         "Total Margin Lending",
+        "Average Margin Lending",
         "Total Interest",
         "Total Commission",
         "Difference",
@@ -491,7 +514,7 @@ if process_btn:
 # Final screen: Rate editor + final summary + Excel download
 # ==============================
 if st.session_state["processed"] and st.session_state["edited_df"] is not None:
-    st.subheader("Final summary (edit Rate per client)")
+    st.subheader("Final summary (edit Rate per account)")
 
     edited_df = st.data_editor(
         st.session_state["edited_df"],
@@ -501,7 +524,7 @@ if st.session_state["processed"] and st.session_state["edited_df"] is not None:
         column_config={
             "Rate": st.column_config.NumberColumn(
                 "Rate",
-                help="Daily interest rate for this client",
+                help="Daily interest rate for this account",
                 format="%.6f",
                 step=0.0001,
                 min_value=0.0,
@@ -510,11 +533,15 @@ if st.session_state["processed"] and st.session_state["edited_df"] is not None:
     )
     st.session_state["edited_df"] = edited_df
 
-    updated = recalc_with_new_rates(edited_df.copy(), st.session_state["exposure_df"])
+    updated = recalc_with_new_rates(
+        edited_df.copy(),
+        st.session_state["exposure_df"],
+        st.session_state["num_days_in_period"],
+    )
 
-    # Format display (no Styler to avoid cell limits)
+    # Display formatting
     display = updated.copy()
-    for c in ["Total Margin Lending", "Total Interest", "Total Commission", "Difference"]:
+    for c in ["Total Margin Lending", "Average Margin Lending", "Total Interest", "Total Commission", "Difference"]:
         display[c] = pd.to_numeric(display[c], errors="coerce").fillna(0.0).round(2)
 
     st.dataframe(display, use_container_width=True)
